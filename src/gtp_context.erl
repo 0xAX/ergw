@@ -34,80 +34,46 @@
 lookup(GtpPort, TEI) ->
     gtp_context_reg:lookup(GtpPort, TEI).
 
-lookup_keys(_, []) ->
-    not_found;
-lookup_keys(GtpPort, [H|T]) ->
-    case gtp_context_reg:lookup(GtpPort, H) of
-	Pid when is_pid(Pid) ->
-	    Pid;
-	_ ->
-	    gtp_context_reg:lookup(GtpPort, T)
-    end.
-
 %% TEID handling for GTPv1 is brain dead....
-handle_message(#request_key{gtp_port = GtpPort} = ReqKey,
+try_handle_message(#request_key{gtp_port = GtpPort} = ReqKey,
 	       #gtp{version = v2, type = MsgType, tei = 0} = Msg)
   when MsgType == change_notification_request;
        MsgType == change_notification_response ->
     Keys = gtp_v2_c:get_msg_keys(Msg),
-    case lookup_keys(GtpPort, Keys) of
-	Context when is_pid(Context) ->
-	    do_handle_message(Context, ReqKey, Msg);
-
-	_ ->
-	    generic_error(ReqKey, Msg, not_found)
-    end;
+    context_handle_message(lookup_keys(GtpPort, Keys), ReqKey, Msg);
 
 %% same as above for GTPv1
-handle_message(#request_key{gtp_port = GtpPort} = ReqKey,
+try_handle_message(#request_key{gtp_port = GtpPort} = ReqKey,
 	       #gtp{version = v1, type = MsgType, tei = 0} = Msg)
   when MsgType == ms_info_change_notification_request;
        MsgType == ms_info_change_notification_response ->
     Keys = gtp_v1_c:get_msg_keys(Msg),
-    case lookup_keys(GtpPort, Keys) of
-	Context when is_pid(Context) ->
-	    do_handle_message(Context, ReqKey, Msg);
+    context_handle_message(lookup_keys(GtpPort, Keys), ReqKey, Msg);
 
-	_ ->
-	    generic_error(ReqKey, Msg, not_found)
+try_handle_message(#request_key{gtp_port = GtpPort} = ReqKey, #gtp{version = Version, tei = 0} = Msg) ->
+    case get_handler(ReqKey, Msg) of
+	{ok, Context} when is_pid(Context) ->
+	    gen_server:cast(Context, {handle_message, ReqKey, Msg, true});
+
+	{ok, Interface, InterfaceOpts} ->
+	    validate_teid(Msg),
+	    Context = context_new(GtpPort, Version, Interface, InterfaceOpts),
+	    context_handle_message(Context, ReqKey, Msg);
+
+	{error, _} = Error ->
+	    throw(Error)
     end;
 
-handle_message(#request_key{gtp_port = GtpPort} = ReqKey, #gtp{version = Version, tei = 0} = Msg) ->
-    Result =
-	case get_handler(ReqKey, Msg) of
-	    {ok, Context} when is_pid(Context) ->
-		gen_server:cast(Context, {handle_message, ReqKey, Msg, true});
+try_handle_message(#request_key{gtp_port = GtpPort} = ReqKey, #gtp{tei = TEI} = Msg) ->
+    context_handle_message(lookup(GtpPort, TEI), ReqKey, Msg).
 
-	    {ok, Interface, InterfaceOpts} = O->
-		lager:error("handle message #1: ~p", [O]),
-		do([error_m ||
-		       validate_teid(Msg),
-		       Context <- gtp_context_sup:new(GtpPort, Version, Interface, InterfaceOpts),
-		       do_handle_message(Context, ReqKey, Msg)
-		   ]);
-
-	    Other ->
-		Other
-	end,
-    lager:debug("Handle TEID == 0: ~p", [Result]),
-    case Result of
-	ok ->
-	    ok;
-
-	{error, Error} ->
-	    generic_error(ReqKey, Msg, Error);
-	_ ->
-	    %% TODO: correct error message
-	    generic_error(ReqKey, Msg, not_found)
-    end;
-
-handle_message(#request_key{gtp_port = GtpPort} = ReqKey, #gtp{tei = TEI} = Msg) ->
-    case lookup(GtpPort, TEI) of
-	Context when is_pid(Context) ->
-	    do_handle_message(Context, ReqKey, Msg);
-
-	_ ->
-	    generic_error(ReqKey, Msg, not_found)
+handle_message(ReqKey, Msg) ->
+    try
+	try_handle_message(ReqKey, Msg)
+    catch
+	throw:{error, Error} ->
+	    lager:error("handler failed with: ~p"),
+	    generic_error(ReqKey, Msg, Error)
     end.
 
 handle_packet_in(GtpPort, IP, Port,
@@ -238,34 +204,18 @@ handle_call(Request, From, #{interface := Interface} = State) ->
     Interface:handle_call(Request, From, State).
 
 handle_cast({handle_message, ReqKey, #gtp{} = Msg, Resent}, State) ->
-    lager:debug("~w: handle gtp: ~w, ~p",
-		[?MODULE, ReqKey#request_key.port, gtp_c_lib:fmt_gtp(Msg)]),
-
-    case validate_message(Msg, State) of
-	[] ->
-	    handle_request(ReqKey, Msg, Resent, State);
-
-	Missing ->
-	    lager:debug("Mis: ~p", [Missing]),
-	    handle_error(ReqKey, Msg, {mandatory_ie_missing, hd(Missing)}, State)
-    end;
+    lager:debug("handle gtp request: ~w, ~p",
+		[ReqKey#request_key.port, gtp_c_lib:fmt_gtp(Msg)]),
+    handle_request(ReqKey, Msg, Resent, State);
 
 handle_cast(Msg, #{interface := Interface} = State) ->
     lager:debug("~w: handle_cast: ~p", [?MODULE, lager:pr(Msg, ?MODULE)]),
     Interface:handle_cast(Msg, State).
 
 handle_info({ReqId, Request, #gtp{} = Response}, State) ->
-
-    case validate_message(Response, State) of
-	[] ->
-	    handle_response(ReqId, Request, Response, State);
-
-	Missing ->
-	    lager:error("Missing IEs in response message: ~p", [Missing]),
-	    %% TODO: handle error
-	    %% handle_error({GtpPort, IP, Port}, Msg, {mandatory_ie_missing, hd(Missing)}, State);
-	    {noreply, State}
-    end;
+    lager:debug("handle gtp response: ~p",
+		[gtp_c_lib:fmt_gtp(Response)]),
+    handle_response(ReqId, Request, Response, State);
 
 handle_info(Info, #{interface := Interface} = State) ->
     lager:debug("handle_info: ~p", [lager:pr(Info, ?MODULE)]),
@@ -283,12 +233,33 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Message Handling functions
 %%%===================================================================
 
-handle_error(#request_key{gtp_port = GtpPort} = ReqKey,
-	     #gtp{version = Version, type = MsgType, seq_no = SeqNo}, Reply, State) ->
-    Handler = gtp_path:get_handler(GtpPort, Version),
-    Response = Handler:build_response({MsgType, Reply}),
+log_ctx_error(#ctx_err{level = Level, where = {File, Line}, reply = Reply}) ->
+    lager:debug("CtxErr: ~w, at ~s:~w, ~p", [Level, File, Line, Reply]).
+
+handle_ctx_error_state(#ctx_err{context = undefined}, State) ->
+    State;
+handle_ctx_error_state(#ctx_err{context = CtxErrContext}, State) ->
+    State#{context => CtxErrContext}.
+
+handle_ctx_error(#ctx_err{level = Level} = CtxErr, State0) ->
+    log_ctx_error(CtxErr),
+    State = handle_ctx_error_state(CtxErr, State0),
+    case Level of
+	?FATAL ->
+	    {stop, normal, State};
+	_ ->
+	    {noreply, State}
+    end.
+
+handle_ctx_error(#ctx_err{reply = Reply} = CtxErr, Handler,
+		 ReqKey, #gtp{type = MsgType, seq_no = SeqNo}, State) ->
+    Response = if is_list(Reply) orelse is_atom(Reply) ->
+		       Handler:build_response({MsgType, Reply});
+		  true ->
+		       Handler:build_response(Reply)
+	       end,
     send_response(ReqKey, Response#gtp{seq_no = SeqNo}),
-    {noreply, State}.
+    handle_ctx_error(CtxErr, State).
 
 handle_request(#request_key{gtp_port = GtpPort} = ReqKey,
 	       #gtp{version = Version, seq_no = SeqNo} = Msg,
@@ -297,7 +268,10 @@ handle_request(#request_key{gtp_port = GtpPort} = ReqKey,
 		[Version, inet:ntoa(ReqKey#request_key.ip), ReqKey#request_key.port, gtp_c_lib:fmt_gtp(Msg)]),
 
     Handler = gtp_path:get_handler(GtpPort, Version),
-    try Interface:handle_request(ReqKey, Msg, Resent, State0) of
+    try
+	validate_message(Msg, State0),
+	Interface:handle_request(ReqKey, Msg, Resent, State0)
+    of
 	{reply, Reply, State1} ->
 	    Response = Handler:build_response(Reply),
 	    send_response(ReqKey, Response#gtp{seq_no = SeqNo}),
@@ -308,18 +282,12 @@ handle_request(#request_key{gtp_port = GtpPort} = ReqKey,
 	    send_response(ReqKey, Response#gtp{seq_no = SeqNo}),
 	    {stop, normal, State1};
 
-	{error, Reply} ->
-	    Response = Handler:build_response(Reply),
-	    send_response(ReqKey, Response#gtp{seq_no = SeqNo}),
-	    {noreply, State0};
-
 	{noreply, State1} ->
-	    {noreply, State1};
-
-	Other ->
-	    lager:error("handle_request failed with: ~p", [Other]),
-	    {noreply, State0}
+	    {noreply, State1}
     catch
+	throw:#ctx_err{} = CtxErr ->
+	    handle_ctx_error(CtxErr, Handler, ReqKey, Msg, State0);
+
 	Class:Error ->
 	    Stack  = erlang:get_stacktrace(),
 	    lager:error("GTP~p failed with: ~p:~p (~p)", [Version, Class, Error, Stack]),
@@ -327,17 +295,19 @@ handle_request(#request_key{gtp_port = GtpPort} = ReqKey,
     end.
 
 handle_response(ReqId, Request, Response, #{interface := Interface} = State0) ->
-    try Interface:handle_response(ReqId, Response, Request, State0) of
+    try
+	validate_message(Response, State0),
+	Interface:handle_response(ReqId, Response, Request, State0)
+    of
 	{stop, State1} ->
 	    {stop, normal, State1};
 
 	{noreply, State1} ->
-	    {noreply, State1};
-
-	Other ->
-	    lager:error("handle_request failed with: ~p", [Other]),
-	    {noreply, State0}
+	    {noreply, State1}
     catch
+	throw:#ctx_err{} = CtxErr ->
+	    handle_ctx_error(CtxErr, State0);
+
 	Class:Error ->
 	    Stack  = erlang:get_stacktrace(),
 	    lager:error("GTP response failed with: ~p:~p (~p)", [Class, Error, Stack]),
@@ -373,9 +343,30 @@ get_handler(#request_key{gtp_port = GtpPort} = ReqKey, Msg) ->
 	    get_handler_if(GtpPort, Msg)
     end.
 
-do_handle_message(Context, #request_key{gtp_port = GtpPort} = ReqKey, Msg) ->
+lookup_keys(_, []) ->
+    throw({error, not_found});
+lookup_keys(GtpPort, [H|T]) ->
+    case gtp_context_reg:lookup(GtpPort, H) of
+	Pid when is_pid(Pid) ->
+	    Pid;
+	_ ->
+	    gtp_context_reg:lookup(GtpPort, T)
+    end.
+
+context_new(GtpPort, Version, Interface, InterfaceOpts) ->
+    case gtp_context_sup:new(GtpPort, Version, Interface, InterfaceOpts) of
+	{ok, Context} ->
+	    Context;
+	{error, Error} ->
+	    throw({error, Error})
+    end.
+
+context_handle_message(Context, #request_key{gtp_port = GtpPort} = ReqKey, Msg)
+  when is_pid(Context) ->
     gtp_context_reg:register(GtpPort, ReqKey, Context),
-    gen_server:cast(Context, {handle_message, ReqKey, Msg, false}).
+    gen_server:cast(Context, {handle_message, ReqKey, Msg, false});
+context_handle_message(_Context, _ReqKey, _Msg) ->
+    throw({error, not_found}).
 
 generic_error(#request_key{gtp_port = GtpPort} = ReqKey,
 	      #gtp{version = Version, type = MsgType, seq_no = SeqNo}, Error) ->
@@ -388,12 +379,19 @@ validate_teid(#gtp{version = v1, type = MsgType, tei = TEID}) ->
 validate_teid(#gtp{version = v2, type = MsgType, tei = TEID}) ->
     gtp_v2_c:validate_teid(MsgType, TEID).
 
-validate_message(#gtp{version = v1, ie = IEs} = Msg, State) ->
-    Cause = gtp_v1_c:get_cause(IEs),
-    validate_ies(Msg, Cause, State);
-validate_message(#gtp{version = v2, ie = IEs} = Msg, State) ->
-    Cause = gtp_v2_c:get_cause(IEs),
-    validate_ies(Msg, Cause, State).
+validate_message(#gtp{version = Version, ie = IEs} = Msg, State) ->
+    Cause = case Version of
+		v1 -> gtp_v1_c:get_cause(IEs);
+		v2 -> gtp_v2_c:get_cause(IEs)
+	    end,
+    case validate_ies(Msg, Cause, State) of
+	[] ->
+	    ok;
+	Missing ->
+	    lager:debug("Missing IEs: ~p", [Missing]),
+	    throw(#ctx_err{level = ?WARNING,
+			   reply = [{mandatory_ie_missing, hd(Missing)}]})
+    end.
 
 validate_ies(#gtp{version = Version, type = MsgType, ie = IEs}, Cause, #{interface := Interface}) ->
     Spec = Interface:request_spec(Version, MsgType, Cause),
