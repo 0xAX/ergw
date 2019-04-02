@@ -167,33 +167,28 @@ handle_info(#aaa_request{procedure = {_, 'ASR'}},
     close_pdn_context(undefined, State),
     {stop, normal, State};
 handle_info(#aaa_request{procedure = {gy, 'RAR'}, request = Request},
-	    #state{context = Context, pfcp = PCtx, session = Session} = State) ->
+	    #state{session = Session} = State) ->
     ergw_aaa_session:response(Session, ok, #{}),
     Now = erlang:monotonic_time(),
 
     %% Triggered CCR.....
-
-    case query_usage_report(Request, Context, PCtx) of
-	#pfcp{type = session_modification_response,
-	      ie = #{pfcp_cause := #pfcp_cause{cause = 'Request accepted'}} = IEs} ->
-
-	    ChargeEv = interim,
-	    UsageReport = maps:get(usage_report_smr, IEs, undefined),
-	    {Online, Offline, _} =
-		ergw_gsn_lib:usage_report_to_charging_events(UsageReport, ChargeEv, PCtx),
-	    ergw_gsn_lib:process_online_charging_events(ChargeEv, Online, Now, Session),
-	    ergw_gsn_lib:process_offline_charging_events(ChargeEv, Offline, Now, Session),
-	    ok;
-	_ ->
-	    ok
-    end,
+    triggered_charging_event(interim, Now, Request, State),
     {noreply, State};
+
+handle_info({update_session, Session, Events} = Us,
+	    #state{context = Context, pfcp = PCtx0} = State) ->
+    lager:warning("UpdateSession: ~p", [Us]),
+    PCtx =  ergw_gsn_lib:session_events(Session, Events, Context, PCtx0),
+    {noreply, State#state{pfcp = PCtx}};
 
 handle_info({timeout, TRef, pfcp_timer} = Info,
 	    #state{pfcp = PCtx0} = State0) ->
+    Now = erlang:monotonic_time(),
     lager:debug("handle_info TDF:~p", [lager:pr(Info, ?MODULE)]),
+
     {Evs, PCtx} = ergw_pfcp:timer_expired(TRef, PCtx0),
-    State = handle_events(Evs, State0#state{pfcp = PCtx}),
+    CtxEvs = ergw_gsn_lib:pfcp_to_context_event(Evs),
+    State = maps:fold(handle_charging_event(_, _, Now, _), State0#state{pfcp = PCtx}, CtxEvs),
     {noreply, State};
 
 handle_info(_Info, State) ->
@@ -322,11 +317,33 @@ close_pdn_context(Reason, #state{context = Context, pfcp = PCtx, session = Sessi
 query_usage_report(#{'Rating-Group' := [RatingGroup]}, Context, PCtx) ->
     ChargingKeys = [{online, RatingGroup}],
     ergw_gsn_lib:query_usage_report(ChargingKeys, Context, PCtx);
+query_usage_report(ChargingKeys, Context, PCtx)
+  when is_list(ChargingKeys) ->
+    ergw_gsn_lib:query_usage_report(ChargingKeys, Context, PCtx);
 query_usage_report(_, Context, PCtx) ->
     ergw_gsn_lib:query_usage_report(Context, PCtx).
 
-handle_events(_Evs, State) ->
-    %% TODO
+triggered_charging_event(ChargeEv, Now, Request,
+			 #state{context = Context, pfcp = PCtx, session = Session}) ->
+    case query_usage_report(Request, Context, PCtx) of
+	#pfcp{type = session_modification_response,
+	      ie = #{pfcp_cause := #pfcp_cause{cause = 'Request accepted'}} = IEs} ->
+
+	    UsageReport = maps:get(usage_report_smr, IEs, undefined),
+	    {Online, Offline, _} =
+		ergw_gsn_lib:usage_report_to_charging_events(UsageReport, ChargeEv, PCtx),
+	    ergw_gsn_lib:process_online_charging_events(ChargeEv, Online, Now, Session),
+	    ergw_gsn_lib:process_offline_charging_events(ChargeEv, Offline, Now, Session),
+	    ok;
+	_ ->
+	    ok
+    end.
+
+handle_charging_event(validity_time, ChargingKeys, Now, State) ->
+    triggered_charging_event(validity_time, Now, ChargingKeys, State),
+    State;
+handle_charging_event(Key, Ev, _Now, State) ->
+    lager:debug("TDF: unhandled charging event ~p:~p",[Key, Ev]),
     State.
 
 %%====================================================================

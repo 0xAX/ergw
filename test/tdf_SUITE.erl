@@ -136,8 +136,55 @@
 	       }
 	      ]}
 	    ]},
-	   {services, [{'Default', [{handler, 'ergw_aaa_static'}]}]},
-	   {apps, [{default, [{session, ['Default']}]}]}
+	   {services,
+	    [{'Default', [{handler, 'ergw_aaa_static'},
+			  {answers, #{'Initial-OCS' =>
+					  #{'Result-Code' => [2001],
+					    'Multiple-Services-Credit-Control' =>
+						[#{'Envelope-Reporting' => [0],
+						   'Granted-Service-Unit' =>
+						       [#{'CC-Time' => [3600],
+							  'CC-Total-Octets' => [102400]}],
+						   'Rating-Group' => [3000],
+						   'Validity-Time' => [2],
+						   'Result-Code' => [2001],
+						   'Time-Quota-Threshold' => [60],
+						   'Volume-Quota-Threshold' => [10240]}
+						]
+					   },
+				      'Update-OCS' =>
+					  #{'Result-Code' => [2001],
+					    'Multiple-Services-Credit-Control' =>
+						[#{'Envelope-Reporting' => [0],
+						   'Granted-Service-Unit' =>
+						       [#{'CC-Time' => [3600],
+							  'CC-Total-Octets' => [102400]}],
+						   'Rating-Group' => [3000],
+						   'Validity-Time' => [2],
+						   'Result-Code' => [2001],
+						   'Time-Quota-Threshold' => [60],
+						   'Volume-Quota-Threshold' => [10240]}
+						]
+					   }
+				     }
+			  }
+			 ]}
+	    ]},
+	   {apps,
+	    [{default,
+	      [{session, ['Default']},
+	       {procedures, [{authenticate, []},
+			     {authorize, []},
+			     {start, []},
+			     {interim, []},
+			     {stop, []},
+			     {{gy, 'CCR-Initial'},   []},
+			     {{gy, 'CCR-Update'},    []},
+			     %%{{gy, 'CCR-Update'},    [{'Default', [{answer, 'Update-If-Down'}]}]},
+			     {{gy, 'CCR-Terminate'}, []}
+			    ]}
+	      ]}
+	    ]}
 	  ]}
 	]).
 
@@ -187,7 +234,8 @@ end_per_group(Group, Config)
 
 common() ->
     [setup_upf,  %% <- keep this first
-     simple_session
+     simple_session,
+     gy_validity_timer
     ].
 
 groups() ->
@@ -281,7 +329,7 @@ simple_session(Config) ->
     UeIPDstIe = ue_ip_address(dst, Config),
 
     packet_in(Config),
-    ct:sleep(1000),
+    ct:sleep({seconds, 1}),
 
     History = ergw_test_sx_up:history('tdf-u'),
     [SRresp|_] =
@@ -321,7 +369,7 @@ simple_session(Config) ->
 		     #pdi{
 			group =
 			    #{network_instance :=
-				  #network_instance{instance = <<3,115,103,105>>},
+				  #network_instance{instance = <<3, "sgi">>},
 			      sdf_filter :=
 				  #sdf_filter{
 				     flow_description =
@@ -344,7 +392,7 @@ simple_session(Config) ->
 		     #pdi{
 			group =
 			    #{network_instance :=
-				  #network_instance{instance = <<3,101,112,99>>},
+				  #network_instance{instance = <<3, "epc">>},
 			      sdf_filter :=
 				  #sdf_filter{
 				     flow_description =
@@ -371,7 +419,7 @@ simple_session(Config) ->
 			    #{destination_interface :=
 				  #destination_interface{interface='Access'},
 			      network_instance :=
-				  #network_instance{instance = <<3,101,112,99>>}
+				  #network_instance{instance = <<3, "epc">>}
 			     }
 		       }
 		}
@@ -387,7 +435,7 @@ simple_session(Config) ->
 			    #{destination_interface :=
 				  #destination_interface{interface='SGi-LAN'},
 			      network_instance :=
-				  #network_instance{instance = <<3,115,103,105>>}
+				  #network_instance{instance = <<3, "sgi">>}
 			     }
 		       }
 		}
@@ -409,10 +457,57 @@ simple_session(Config) ->
     {tdf, Pid} = gtp_context_reg:lookup({ue, <<3, "sgi">>, UeIP}),
     Pid ! stop_from_session,
 
-    ct:sleep(1000),
+    ct:sleep({seconds, 1}),
 
     ok = meck:wait(?HUT, terminate, '_', ?TIMEOUT),
     meck_validate(Config),
+    ok.
+
+%%--------------------------------------------------------------------
+
+gy_validity_timer() ->
+    [{doc, "Check Validity-Timer attached to MSCC"}].
+gy_validity_timer(Config) ->
+    {ok, Cfg0} = application:get_env(ergw_aaa, apps),
+    Session = cfg_get_value([default, session, 'Default'], Cfg0),
+    UpdCfg =
+	#{default =>
+	      #{procedures =>
+		    #{
+		      {gy, 'CCR-Initial'} =>
+			  [{'Default', Session#{answer => 'Initial-OCS'}}],
+		      {gy, 'CCR-Update'} =>
+			  [{'Default', Session#{answer => 'Update-OCS'}}]
+		     }
+	       }
+	 },
+    Cfg = maps_recusive_merge(Cfg0, UpdCfg),
+    ok = application:set_env(ergw_aaa, apps, Cfg),
+
+    UeIP = ergw_inet:ip2bin(proplists:get_value(ue_ip, Config)),
+
+    packet_in(Config),
+    ct:sleep({seconds, 10}),
+
+    ?match(X when X >= 3, meck:num_calls(?HUT, handle_info, [{timeout, '_', pfcp_timer}, '_'])),
+
+    CCRU = lists:foldl(
+	     fun({_, {ergw_aaa_session, invoke, [_, S, {gy,'CCR-Update'}, _]}, _}, Acc) ->
+		     ?match(#{used_credits := [{3000, #{'Reporting-Reason' := [4]}}]}, S),
+		     [S|Acc];
+		(_, Acc) -> Acc
+	     end, [], meck:history(ergw_aaa_session)),
+    ?match(X when X >= 3, length(CCRU)),
+
+    {tdf, Pid} = gtp_context_reg:lookup({ue, <<3, "sgi">>, UeIP}),
+    Pid ! stop_from_session,
+
+    ct:sleep({seconds, 1}),
+
+    ok = meck:wait(?HUT, terminate, '_', ?TIMEOUT),
+    meck_validate(Config),
+
+    ok = application:set_env(ergw_aaa, apps, Cfg0),
     ok.
 
 %%%===================================================================
@@ -451,3 +546,19 @@ packet_in(Config) ->
     SRreq = #pfcp{version = v1, type = session_report_request, ie = IEs},
 
     ok = ergw_test_sx_up:send('tdf-u', SEID, SRreq).
+
+maps_recusive_merge(Key, Value, Map) ->
+    maps:update_with(Key, fun(V) -> maps_recusive_merge(V, Value) end, Value, Map).
+
+maps_recusive_merge(M1, M2)
+  when is_map(M1) andalso is_map(M1) ->
+    maps:fold(fun maps_recusive_merge/3, M1, M2);
+maps_recusive_merge(_, New) ->
+    New.
+
+cfg_get_value([], Cfg) ->
+    Cfg;
+cfg_get_value([H|T], Cfg) when is_map(Cfg) ->
+    cfg_get_value(T, maps:get(H, Cfg));
+cfg_get_value([H|T], Cfg) when is_list(Cfg) ->
+    cfg_get_value(T, proplists:get_value(H, Cfg)).
