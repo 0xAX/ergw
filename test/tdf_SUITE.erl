@@ -14,6 +14,7 @@
 -include_lib("pfcplib/include/pfcp_packet.hrl").
 -include("../include/ergw.hrl").
 -include("ergw_test_lib.hrl").
+-include_lib("ergw_aaa/include/diameter_3gpp_ts32_299.hrl").
 %%-include("ergw_pgw_test_lib.hrl").
 
 -define(TIMEOUT, 2000).
@@ -130,7 +131,7 @@
 				     }],
 			       'Metering-Method'  => [1],
 			       'Precedence' => [100],
-			       'Offline'  => [1]
+		               'Offline'  => [1]
 			      }
 			}
 	       }
@@ -235,7 +236,8 @@ end_per_group(Group, Config)
 common() ->
     [setup_upf,  %% <- keep this first
      simple_session,
-     gy_validity_timer
+     gy_validity_timer,
+     sx_session_report_volqu
     ].
 
 groups() ->
@@ -348,6 +350,7 @@ simple_session(Config) ->
 	     (_) ->false
 	  end, History),
 
+    ct:pal("IE ~p~n", [SER#pfcp.ie]),
     #{create_pdr := PDRs0,
       create_far := FARs0,
       create_urr := URR
@@ -510,6 +513,64 @@ gy_validity_timer(Config) ->
     ok = application:set_env(ergw_aaa, apps, Cfg0),
     ok.
 
+sx_session_report_volqu() ->
+    [{doc, "Test for session report request with exhausted volume"}].
+sx_session_report_volqu(Config) ->
+    {ok, Cfg0} = application:get_env(ergw_aaa, apps),
+    Session = cfg_get_value([default, session, 'Default'], Cfg0),
+    UpdCfg =
+	#{default =>
+	      #{procedures =>
+		    #{
+		      {gy, 'CCR-Initial'} =>
+			  [{'Default', Session#{answer => 'Initial-OCS'}}],
+		      {gy, 'CCR-Update'} =>
+                          [{'Default', Session#{answer => 'Update-OCS'}}]
+                 }
+	       }
+	 },
+    Cfg = maps_recusive_merge(Cfg0, UpdCfg),
+    ok = application:set_env(ergw_aaa, apps, Cfg),
+
+    UeIP = ergw_inet:ip2bin(proplists:get_value(ue_ip, Config)),
+
+    % Sx start
+    packet_in(Config),
+    ct:sleep({seconds, 5}),
+
+    % Sx report with volqu
+    [[SEID]] = ets:match(gtp_context_reg, {{seid, '$1'},{tdf, '_'}}),
+    % Repalce session id with TDF session id, so tdf:sx_report/2 will be called
+    TDFConfig = lists:keyreplace(seid, 1, Config, {seid, SEID}),
+    packet_in(TDFConfig, #usage_report_trigger{volqu = 1}),
+    ct:sleep({seconds, 10}),
+
+    % As Offline charging is configured volqu=1 should trigger Rf Update
+    CCRU = lists:foldl(
+	     fun({_, {ergw_aaa_session, invoke, [_, S, {rf, 'Update'}, _]}, _}, Acc) ->
+                     case S of
+                         #{service_data := [#{'Change-Condition' := [?'DIAMETER_3GPP_CHARGING_REPORTING-REASON_QUOTA_EXHAUSTED']}]} ->
+                             [S|Acc];
+                         _ ->
+                             Acc
+                     end;
+		(_, Acc) ->
+                     Acc
+	     end, [], meck:history(ergw_aaa_session)),
+    ?match(X when X == 1, length(CCRU)),
+
+    {tdf, Pid} = gtp_context_reg:lookup({ue, <<3, "sgi">>, UeIP}),
+    Pid ! stop_from_session,
+
+    ct:sleep({seconds, 1}),
+
+    ok = meck:wait(?HUT, terminate, '_', ?TIMEOUT),
+    meck_validate(Config),
+
+    ok = application:set_env(ergw_aaa, apps, Cfg0),
+
+    ok.
+
 %%%===================================================================
 %%% Helper
 %%%===================================================================
@@ -531,6 +592,8 @@ ue_ip_address(Type, Config) ->
     end.
 
 packet_in(Config) ->
+    packet_in(Config, #usage_report_trigger{start = 1}).
+packet_in(Config, UsageReportTrigger) ->
     VRF = <<3, "epc">>,
     Node = proplists:get_value(tdf_node, Config),
     PCtx = ergw_sx_node:test_cmd(Node, pfcp_ctx),
@@ -539,7 +602,7 @@ packet_in(Config) ->
     SxIP = ergw_inet:ip2bin(proplists:get_value(tdf_u_sx, Config)),
 
     URsrr = [#urr_id{id = UrrId},
-	     #usage_report_trigger{start = 1},
+	     UsageReportTrigger,
 	     ue_ip_address(src, Config)],
     IEs = [#report_type{usar = 1},
 	   #usage_report_srr{group = URsrr}],

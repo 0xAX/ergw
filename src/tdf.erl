@@ -80,8 +80,11 @@ validate_option(Opt, Value) ->
 %% ergw_context API
 %%====================================================================
 
+sx_report(Server, #pfcp{type = session_report_request,
+                        ie = #{report_type := #report_type{usar = 1}}} = Report) ->
+    gen_server:call(Server, {sx, Report});
 sx_report(_Server, Report) ->
-    lager:error("TDF Sx Report: ~p", [Report]),
+    lager:error("Unhandled TDF Sx Report: ~p", [Report]),
     ok.
 
 port_message(Request, Msg) ->
@@ -133,10 +136,20 @@ init([Node, InVRF, IP4, IP6, #{apn := APN} = SxOpts]) ->
     lager:info("TDF process started for ~p", [[Node, IP4, IP6]]),
     {ok, State}.
 
+handle_call({sx, #pfcp{type = session_report_request,
+                       ie = #{report_type := #report_type{usar = 1},
+                              usage_report_srr := UsageReport}}},
+            _From, #state{pfcp = PCtx, session = Session} = State) ->
+    Now = erlang:monotonic_time(),
+    ChargeEv = interim,
+    {Online, Offline, _} =
+	ergw_gsn_lib:usage_report_to_charging_events(UsageReport, ChargeEv, PCtx),
+    ergw_gsn_lib:process_online_charging_events(ChargeEv, Online, Now, Session),
+    ergw_gsn_lib:process_offline_charging_events(ChargeEv, Offline, Now, Session),
+    {reply, {ok, PCtx}, State};
 handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
-
 
 handle_cast(init, State) ->
     %% start Rf/Gx/Gy interaction
