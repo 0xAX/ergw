@@ -18,6 +18,8 @@
 %%-include("ergw_pgw_test_lib.hrl").
 -include_lib("stdlib/include/ms_transform.hrl").
 
+-include_lib("diameter/include/diameter.hrl").
+
 -define(TIMEOUT, 2000).
 -define(HUT, tdf).				%% Handler Under Test
 
@@ -326,12 +328,12 @@ end_per_group(Group, Config)
 
 common() ->
     [setup_upf,  %% <- keep this first
-     simple_session,
-     gy_validity_timer,
-     volume_threshold,
-     redirect_info,
-     tdf_app_id
-    ].
+     %% simple_session,
+     %% gy_validity_timer,
+     %% volume_threshold,
+     %% redirect_info,
+     %% tdf_app_id,
+     gx_rar].
 
 groups() ->
     [{ipv4, [], common()},
@@ -437,6 +439,51 @@ setup_upf(Config) ->
 		   }}, URR),
 
     meck_validate(Config),
+    ok.
+
+gx_rar() ->
+    [{doc, "Test Gx RAR request"}].
+gx_rar(Config) ->
+    packet_in(Config),
+    ct:sleep({seconds, 1}),
+
+    History = ergw_test_sx_up:history('tdf-u'),
+    [SRresp|_] =
+	lists:filter(
+	  fun(#pfcp{type = session_report_response}) -> true;
+	     (_) ->false
+	  end, History),
+    ?match(#pfcp{ie = #{pfcp_cause :=
+                            #pfcp_cause{cause = 'Request accepted'}}}, SRresp),
+
+    CCRI = lists:filter(
+	     fun({_, {ergw_aaa_session, invoke, [_, _S, {gx,'CCR-Initial'}, _]}, _} = _Call) ->
+                     true;
+		(_) ->
+                     false
+	     end, meck:history(ergw_aaa_session)),
+
+    [{_, _, {ok, Data, _}}] = CCRI,
+    SessionId = maps:get('Diameter-Session-Id', Data),
+    Caps = #diameter_caps{origin_host = {"test", "test"},
+                          origin_realm = {"test", "test"},
+                          origin_state_id = {"test", "test"}},
+    RAA = ergw_aaa_gx:handle_request(#diameter_packet{msg = ['RAR' | #{'Session-Id' => SessionId,
+                                                                       'Auth-Application-Id' => 16777238,
+                                                                       'CC-Request-Number' => 0,
+                                                                       'Charging-Rule-Remove' => [#{'Charging-Rule-Name' => [<<"r-0001">>]}]}]},
+                                        svc, {ref, Caps}),
+
+    SessionModificationReqs = lists:filter(
+	     fun({pfcp, v1, session_modification_request, _, _, _}) ->
+                     true;
+		(_) ->
+                     false
+	     end, ergw_test_sx_up:history('tdf-u')),
+
+    ct:pal("result ~p~n", [RAA]),
+    ?match(1, length(SessionModificationReqs)),
+    ?match(1, RAA),
     ok.
 
 simple_session() ->

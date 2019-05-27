@@ -207,11 +207,25 @@ handle_info(#aaa_request{procedure = {gy, 'RAR'}, events = Events},
     %% Triggered CCR.....
     triggered_charging_event(interim, Now, Events, State),
     {noreply, State};
-handle_info(#aaa_request{procedure = {gx, 'RAR'}, events = Events},
-            #state{session = Session} = State) ->
-    io:format("WE ARE IN TDF RAR Handler ~n"),
+handle_info(#aaa_request{procedure = {gx, 'RAR'}, session = SessionOpts, events = GxEvents},
+            #state{context = Context, session = Session, pfcp = PCtx0} = State) ->
+    PCCRules0 = maps:get('PCC-Rules', SessionOpts, #{}),
+    RuleBase = ergw_charging:rulebase(),
+    % TODO handle PCCErrors
+    {PCCRules, PCCErrors} =
+        ergw_gsn_lib:gx_events_to_pcc_rules(GxEvents, RuleBase, PCCRules0),
+
+    io:format("PCCRules  ~p~n", [PCCRules]),
+    io:format("PCCErrors ~p~n", [PCCErrors]),
+
+    % possible values are - PCCErrors [{not_found,<<"r-0002">>}]
+
+    URRActions = [], % TODO add Gy/Rf reporting
+    PCtx = ergw_gsn_lib:modify_sgi_session(SessionOpts#{'PCC-Rules' => PCCRules},
+                                           URRActions, #{}, Context, PCtx0),
+    % TODO fill RAA response
     ergw_aaa_session:response(Session, ok, #{}),
-    {noreply, State};
+    {noreply, State#state{pfcp = PCtx}};
 handle_info({update_session, Session, Events} = Us,
 	    #state{context = Context, pfcp = PCtx0} = State) ->
     lager:warning("UpdateSession: ~p", [Us]),
