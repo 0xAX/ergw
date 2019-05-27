@@ -199,15 +199,19 @@ handle_info(#aaa_request{procedure = {_, 'ASR'}},
     ergw_aaa_session:response(Session, ok, #{}),
     close_pdn_context(normal, State),
     {stop, normal, State};
-handle_info(#aaa_request{procedure = {gy, 'RAR'}, request = Request},
+handle_info(#aaa_request{procedure = {gy, 'RAR'}, events = Events},
 	    #state{session = Session} = State) ->
     ergw_aaa_session:response(Session, ok, #{}),
     Now = erlang:monotonic_time(),
 
     %% Triggered CCR.....
-    triggered_charging_event(interim, Now, Request, State),
+    triggered_charging_event(interim, Now, Events, State),
     {noreply, State};
-
+handle_info(#aaa_request{procedure = {gx, 'RAR'}, events = Events},
+            #state{session = Session} = State) ->
+    io:format("WE ARE IN TDF RAR Handler ~n"),
+    ergw_aaa_session:response(Session, ok, #{}),
+    {noreply, State};
 handle_info({update_session, Session, Events} = Us,
 	    #state{context = Context, pfcp = PCtx0} = State) ->
     lager:warning("UpdateSession: ~p", [Us]),

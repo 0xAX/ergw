@@ -147,13 +147,13 @@ handle_info(#aaa_request{procedure = {_, 'ASR'}},
     ergw_aaa_session:response(Session, ok, #{}),
     delete_context(undefined, administrative, Context),
     {noreply, State};
-handle_info(#aaa_request{procedure = {gy, 'RAR'}, request = Request},
+handle_info(#aaa_request{procedure = {gy, 'RAR'}, events = Events},
 	    #{'Session' := Session} = State) ->
     ergw_aaa_session:response(Session, ok, #{}),
     Now = erlang:monotonic_time(),
 
     %% Triggered CCR.....
-    triggered_charging_event(interim, Now, Request, State),
+    triggered_charging_event(interim, Now, Events, State),
     {noreply, State};
 
 handle_info({pfcp_timer, #{validity_time := ChargingKeys}}, State) ->
